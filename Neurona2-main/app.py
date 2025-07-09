@@ -1,13 +1,21 @@
 from flask import Flask, render_template, request, redirect, url_for, session, flash
 import sqlite3
 import os
+import secrets
+import re
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-app.secret_key = 'your_secret_key_here'  # Change this to something secure
+app.secret_key = secrets.token_hex(16)
 DB_NAME = "users.db"
 
-# Create DB if it doesn't exist
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def init_db():
     if not os.path.exists(DB_NAME):
         conn = sqlite3.connect(DB_NAME)
@@ -21,33 +29,72 @@ def init_db():
                 role TEXT NOT NULL
             )
         ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS ideas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                creator_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                category TEXT NOT NULL,
+                industry TEXT,
+                summary TEXT,
+                description TEXT,
+                funding_needed REAL,
+                equity_offered REAL,
+                pitch_deck TEXT,
+                contact_email TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (creator_id) REFERENCES users(id)
+            )
+        ''')
+
+        admin_email = "admin@neurona.com"
+        admin_password = "admin@123"
+        hashed_pw = generate_password_hash(admin_password)
+        c.execute("INSERT INTO users (username, email, password, role) VALUES (?, ?, ?, ?)",
+                  ("Admin", admin_email, hashed_pw, "admin"))
         conn.commit()
         conn.close()
+        print(f" Admin created: {admin_email} / {admin_password}")
 
-# Homepage
+
 @app.route('/')
 def home():
     return render_template('index.html')
 
-# Register new users
+
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
         username = request.form['username'].strip()
         email = request.form['email'].strip()
-        raw_password = request.form['password'].strip()
+        password = request.form['password'].strip()
+        confirm_password = request.form['confirm_password'].strip()
         role = request.form['role']
 
-        if not username or not email or not raw_password or not role:
-            flash('Please fill all fields', 'danger')
+        if not username or not email or not password or not confirm_password or not role:
+            flash('Please fill all fields.', 'danger')
             return redirect(url_for('register'))
 
-        hashed_password = generate_password_hash(raw_password)
+        if password != confirm_password:
+            flash('Passwords do not match.', 'danger')
+            return redirect(url_for('register'))
 
-        conn = sqlite3.connect(DB_NAME)
+        allowed_domains = ["gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "neurona.com"]
+        email_domain = email.split('@')[-1].lower()
+        if email_domain not in allowed_domains:
+            flash(f"Email domain must be one of: {', '.join(allowed_domains)}", 'danger')
+            return redirect(url_for('register'))
+
+        if len(password) < 8 or not re.search(r'[!@#$%^&*(),.?":{}|<>]', password):
+            flash('Password must be at least 8 characters and include a special character.', 'danger')
+            return redirect(url_for('register'))
+
+        hashed_password = generate_password_hash(password)
+
+        conn = get_db_connection()
         c = conn.cursor()
         try:
-            c.execute("INSERT INTO users (username, email, password, role) VALUES (?, ?, ?, ?)",
+            c.execute("INSERT INTO users(username, email, password, role) VALUES (?, ?, ?, ?)",
                       (username, email, hashed_password, role))
             conn.commit()
             flash('Registration successful! Please login.', 'success')
@@ -60,67 +107,109 @@ def register():
 
     return render_template('register.html')
 
-# Login existing users
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
         email = request.form['email'].strip()
         password = request.form['password'].strip()
-        role = request.form['role']
 
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         c = conn.cursor()
-        c.execute("SELECT * FROM users WHERE email=? AND role=?", (email, role))
+        c.execute("SELECT * FROM users WHERE email=?", (email,))
         user = c.fetchone()
         conn.close()
 
         if user:
-            stored_hash = user[3]
+            stored_hash = user['password']
             if check_password_hash(stored_hash, password):
-                session['username'] = user[1]
-                session['email'] = email
-                session['role'] = role
+                session['username'] = user['username']
+                session['email'] = user['email']
+                session['role'] = user['role']
                 flash('Login successful!', 'success')
-                return redirect(url_for(f"{role}_dashboard"))
+                return redirect(url_for(f"{user['role']}_dashboard"))
             else:
-                flash('Incorrect Password.', 'danger')
+                flash('Incorrect password.', 'danger')
         else:
-            flash('Invalid Email or Role.', 'danger')
+            flash('Invalid email.', 'danger')
 
         return redirect(url_for('login'))
 
     return render_template('login.html')
 
+
 @app.route('/creator_dashboard')
 def creator_dashboard():
     if 'username' in session and session.get('role') == 'creator':
         return render_template('creator_dashboard.html', username=session['username'])
-    flash('Access denied. Please log in as Creator.', 'danger')
+    flash('Access denied. Please login as Creator.', 'danger')
     return redirect(url_for('login'))
+
 
 @app.route('/investor_dashboard')
 def investor_dashboard():
     if 'username' in session and session.get('role') == 'investor':
         return render_template('investor_dashboard.html', username=session['username'])
-    flash('Access denied. Please log in as Investor.', 'danger')
+    flash('Access denied. Please login as Investor.', 'danger')
     return redirect(url_for('login'))
 
-# Admin Dashboard
+
 @app.route('/admin_dashboard')
 def admin_dashboard():
-    if 'username' in session and session.get('role') == 'admin':
-        return f"Welcome Admin {session['username']}"
-    flash('Access denied. Please log in as Admin.', 'danger')
-    return redirect(url_for('login'))
+    if 'role' not in session or session['role'] != 'admin':
+        flash('Access denied. Please login as Admin.', 'danger')
+        return redirect(url_for('login'))
+    return render_template('admin_dashboard.html', username=session.get('username'))
 
-# Logout
+
 @app.route('/logout')
 def logout():
     session.clear()
     flash('You have been logged out.', 'success')
     return redirect(url_for('login'))
 
-# Run app
+
+@app.route('/submit_idea', methods=['GET', 'POST'])
+def submit_idea():
+    if 'username' not in session or session['role'] != 'creator':
+        flash('Only creators can submit ideas.', 'danger')
+        return redirect(url_for('login'))
+
+    if request.method == 'POST':
+        title = request.form['title']
+        category = request.form['category']
+        industry = request.form.get('industry')
+        summary = request.form.get('summary')
+        description = request.form.get('description')
+        funding = request.form.get('funding_needed', type=float)
+        equity = request.form.get('equity_offered', type=float)
+        contact_email = request.form.get('contact_email')
+
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT id FROM users WHERE email = ?", (session['email'],))
+        creator = c.fetchone()
+
+        if creator:
+            creator_id = creator['id']
+            c.execute('''
+                INSERT INTO ideas (
+                    creator_id, title, category, industry, summary, description,
+                    funding_needed, equity_offered, contact_email
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (creator_id, title, category, industry, summary, description, funding, equity, contact_email))
+            conn.commit()
+            conn.close()
+            flash('Idea submitted successfully!', 'success')
+            return redirect(url_for('creator_dashboard'))
+        else:
+            conn.close()
+            flash('Creator not found.', 'danger')
+            return redirect(url_for('submit_idea'))
+
+    return render_template('submit_idea.html')
+
+
 if __name__ == '__main__':
     init_db()
     app.run(debug=True)
